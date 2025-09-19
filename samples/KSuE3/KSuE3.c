@@ -459,7 +459,19 @@ int main(int argc, char* argv[])
                     timeout_ms -= 100;
                     if (timeout_ms <= 0)
                     {
-                        fprintf(stderr, "\nError: Drive did not become operational within the timeout period.\n");
+                         // Modified: Add specific error message for timeout in fault state
+                        if ((g_current_status_word & 0x08) != 0)
+                        {
+                            fprintf(stderr, "\nError: Drive timed out in FAULT state (0x%04X).\n", g_current_status_word);
+                            fprintf(stderr, "This is likely a hardware issue. Please check:\n");
+                            fprintf(stderr, "1. 24-48V Motor Power Supply is ON.\n");
+                            fprintf(stderr, "2. Motor and Encoder cables are securely connected.\n");
+                            fprintf(stderr, "3. The motor is not physically jammed.\n");
+                        }
+                        else
+                        {
+                            fprintf(stderr, "\nError: Drive did not become operational within the timeout period. Final status: 0x%04X\n", g_current_status_word);
+                        }
                         keep_running = false;
                     }
                 }
