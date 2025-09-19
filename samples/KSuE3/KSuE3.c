@@ -45,7 +45,7 @@ typedef enum {
     MOTION_DECELERATING
 } motion_state_t;
 
-// --- Global Motion Profile Variables ---
+// --- Global Motion Profile & Status Variables ---
 // These are atomic or volatile to ensure safe access between the main and RT threads.
 atomic_int_fast64_t g_target_pos_counts = 0;
 volatile double g_current_pos_counts = 0.0;
@@ -53,6 +53,10 @@ volatile double g_current_vel_cps = 0.0; // Counts per second
 volatile double g_max_vel_cps = 0.0;
 volatile double g_accel_cps2 = 0.0;      // Counts per second^2
 atomic_int g_motion_state = MOTION_IDLE;
+volatile atomic_bool g_is_bus_operational = false;
+volatile atomic_bool g_is_drive_operational = false;
+volatile atomic_uint_fast16_t g_current_status_word = 0;
+volatile atomic_int_fast32_t g_actual_position = 0;
 
 
 // Define structs that match the slave's PDO mapping from the manual.
@@ -119,16 +123,32 @@ bool check_state(const uint16_t statusword, const uint16_t expected_mask, const 
 void set_target_motion(double target_deg, double speed_dps, double accel_dps2)
 {
     printf("\nNew move requested: %.2f degrees at %.2f deg/s.\n", target_deg, speed_dps);
-    g_target_pos_counts = (int64_t)(target_deg * COUNTS_PER_DEGREE);
+    
+    // Calculate final target position in encoder counts
+    long long start_pos = g_actual_position;
+    g_target_pos_counts = start_pos + (long long)(target_deg * COUNTS_PER_DEGREE);
+
     g_max_vel_cps = speed_dps * COUNTS_PER_DEGREE;
     g_accel_cps2 = accel_dps2 * COUNTS_PER_DEGREE;
     
     // Initialize motion state. The RT thread will pick this up.
-    g_current_pos_counts = input_data->position_actual_value; // Start from current actual position
+    g_current_pos_counts = g_actual_position;
     g_current_vel_cps = 0.0;
     g_motion_state = MOTION_ACCELERATING;
 }
 
+#ifndef _MSC_VER
+// Helper function for POSIX sleep logic
+void add_timespec(struct timespec *ts, int64 nsec)
+{
+   ts->tv_nsec += nsec;
+   while (ts->tv_nsec >= 1000000000)
+   {
+      ts->tv_nsec -= 1000000000;
+      ts->tv_sec++;
+   }
+}
+#endif
 
 /**
  * @brief The main real-time thread for cyclic EtherCAT communication.
@@ -141,63 +161,99 @@ void* ec_thread_func(void* arg)
     pthread_setname_np(pthread_self(), "ec_thread");
 #endif
     
-    bool is_bus_operational = false;
-    bool is_drive_operational = false;
-    int wkc;
-    int op_request_cycle_count = 0;
-    const int INITIAL_CYCLES = 50; // Run for 100ms to establish communication
+    bool is_dc_synced = false;
+    bool op_request_sent = false;
+
+    // --- Timing variables for DC synchronization ---
+#ifdef _MSC_VER
+    LARGE_INTEGER a, b;
+    int64_t to_time;
+    QueryPerformanceFrequency(&a);
+    QueryPerformanceCounter(&b);
+    to_time = b.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
 
     while (keep_running)
     {
-        // Use Distributed Clocks to synchronize the loop
-        ec_dcsync0(&ec_context, SLAVE_ID, CYCLE_TIME_NS, 0);
+        // --- DC Synchronization Logic ---
+#ifdef _MSC_VER
+        to_time += (a.QuadPart / 1000) * CYCLE_TIME_MS;
+        QueryPerformanceCounter(&b);
+        int64_t sleep_time_ticks = to_time - b.QuadPart;
+        if (sleep_time_ticks > 0) {
+            Sleep((DWORD)(sleep_time_ticks * 1000 / a.QuadPart));
+        }
+#else
+        add_timespec(&ts, CYCLE_TIME_NS);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+#endif
 
         ecx_send_processdata(&ec_context);
-        wkc = ecx_receive_processdata(&ec_context, EC_TIMEOUTRET);
+        int wkc = ecx_receive_processdata(&ec_context, EC_TIMEOUTRET);
 
-        if (wkc < g_expected_wkc)
-        {
-            printf("Working Counter less than expected. WKC: %d, Expected: %d\n", wkc, g_expected_wkc);
+        if (wkc < g_expected_wkc && g_is_bus_operational) {
+            // Handle error, maybe set a global error flag
         }
-
-        op_request_cycle_count++;
         
+        // Update global status variables for the main thread to read
+        g_current_status_word = input_data->status_word;
+        g_actual_position = input_data->position_actual_value;
+
         // --- EtherCAT State Machine Handling ---
-        if (!is_bus_operational)
+        if (!g_is_bus_operational)
         {
-            // After a few cycles to satisfy the watchdog, request OP state
-            if (op_request_cycle_count == INITIAL_CYCLES)
+            if (!is_dc_synced)
+            {
+                if (ec_context.slavelist[SLAVE_ID].hasdc && (ec_context.DCtime > 0))
+                {
+                    printf("DC Clock synchronized.\n");
+                    is_dc_synced = true;
+                }
+            }
+
+            if (is_dc_synced && !op_request_sent)
             {
                 printf("Requesting OPERATIONAL state for all slaves...\n");
                 ec_context.slavelist[0].state = EC_STATE_OPERATIONAL;
                 ecx_writestate(&ec_context, 0);
+                op_request_sent = true;
             }
-            // Check if the state transition was successful
-            else if (op_request_cycle_count > INITIAL_CYCLES)
+            
+            if (op_request_sent)
             {
                 ecx_readstate(&ec_context);
                 if (ec_context.slavelist[SLAVE_ID].state == EC_STATE_OPERATIONAL)
                 {
                      printf("All slaves reached OPERATIONAL state.\n");
-                     is_bus_operational = true;
+                     g_is_bus_operational = true;
+                }
+                // ADDED: Check for error state and print AL status code
+                else if (ec_context.slavelist[SLAVE_ID].state & EC_STATE_ERROR)
+                {
+                    fprintf(stderr, "Error: Slave %d is in ERROR state 0x%04X, AL status code: 0x%04X (%s)\n",
+                           SLAVE_ID, ec_context.slavelist[SLAVE_ID].state,
+                           ec_context.slavelist[SLAVE_ID].ALstatuscode,
+                           ec_ALstatuscode2string(ec_context.slavelist[SLAVE_ID].ALstatuscode));
+                    keep_running = false; // Stop the application on error
                 }
             }
         }
         else // Bus is operational, now handle CiA 402 drive state machine
         {
-            uint16_t current_status = input_data->status_word;
-
-            if (!is_drive_operational)
+            if (!g_is_drive_operational)
             {
+                uint16_t current_status = g_current_status_word;
                 if (check_state(current_status, 0x4F, 0x40)) { output_data->control_word = 0x06; }
                 else if (check_state(current_status, 0x6F, 0x21)) { output_data->control_word = 0x07; }
                 else if (check_state(current_status, 0x6F, 0x23)) { output_data->control_word = 0x0F; }
                 else if (check_state(current_status, 0x6F, 0x27))
                 {
-                    if (!is_drive_operational)
+                    if (!g_is_drive_operational)
                     {
-                        printf("Drive state: Operation Enabled. Ready for motion commands.\n");
-                        is_drive_operational = true;
+                        g_is_drive_operational = true;
                         g_current_pos_counts = input_data->position_actual_value;
                         output_data->target_position = input_data->position_actual_value;
                     }
@@ -254,19 +310,8 @@ void* ec_thread_func(void* arg)
                 }
                 
                 output_data->target_position = (int32_t)g_current_pos_counts;
-            
-                printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X\r", 
-                       (long long)target_pos,
-                       input_data->position_actual_value, 
-                       (current_motion_state == MOTION_ACCELERATING) ? "Accelerating" :
-                       (current_motion_state == MOTION_CRUISING) ? "Cruising" :
-                       (current_motion_state == MOTION_DECELERATING) ? "Decelerating" : "Idle",
-                       current_status);
-                fflush(stdout);
             }
         }
-
-        // The old Sleep()/nanosleep() is no longer needed, as ec_dcsync0() handles the timing.
     }
     return NULL;
 }
@@ -292,6 +337,9 @@ int main(int argc, char* argv[])
     if (ecx_init(&ec_context, ifname))
     {
         printf("ec_init on %s succeeded.\n", ifname);
+
+        // For TI ESCs, overlapped mode is required for correct WKC in OP state
+        ec_context.overlappedMode = TRUE;
 
         if (ecx_config_init(&ec_context) > 0)
         {
@@ -337,20 +385,45 @@ int main(int argc, char* argv[])
             
             pthread_create(&ec_thread, NULL, &ec_thread_func, NULL);
             
-            // Wait a moment for thread to initialize and reach Operation Enabled state
+            // Wait for the RT thread to signal that the drive is ready
+            int timeout_ms = 5000;
+            while(!g_is_drive_operational && timeout_ms > 0 && keep_running)
+            {
 #ifdef _MSC_VER
-            Sleep(500);
+                Sleep(10);
 #else
-            struct timespec sleep_time = {0, 500 * 1000000};
-            nanosleep(&sleep_time, NULL);
+                struct timespec sleep_time = {0, 10 * 1000000};
+                nanosleep(&sleep_time, NULL);
 #endif
-            
-            // Set the target motion after the thread is running
-            set_target_motion(target_angle, target_speed, target_accel);
+                timeout_ms -= 10;
+            }
 
+            if (!g_is_drive_operational)
+            {
+                fprintf(stderr, "Error: Drive did not become operational within the timeout period.\n");
+                keep_running = false;
+            }
+            else
+            {
+                 // Set the target motion now that the drive is confirmed ready
+                set_target_motion(target_angle, target_speed, target_accel);
+            }
 
+            // --- Main thread becomes the status printing loop ---
             while (keep_running)
             {
+                if (g_is_drive_operational)
+                {
+                    motion_state_t current_motion_state = g_motion_state;
+                    printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X\r", 
+                       (long long)g_target_pos_counts,
+                       (int)g_actual_position,
+                       (current_motion_state == MOTION_ACCELERATING) ? "Accelerating" :
+                       (current_motion_state == MOTION_CRUISING) ? "Cruising" :
+                       (current_motion_state == MOTION_DECELERATING) ? "Decelerating" : "Idle",
+                       (unsigned int)g_current_status_word);
+                    fflush(stdout);
+                }
 #ifdef _MSC_VER
                 Sleep(100);
 #else
@@ -382,4 +455,3 @@ int main(int argc, char* argv[])
     printf("Shutdown complete.\n");
     return EXIT_SUCCESS;
 }
-
