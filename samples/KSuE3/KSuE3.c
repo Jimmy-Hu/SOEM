@@ -209,14 +209,12 @@ void* ec_thread_func(void* arg)
             {
                 if (ec_context.slavelist[SLAVE_ID].hasdc && (ec_context.DCtime > 0))
                 {
-                    printf("DC Clock synchronized.\n");
                     is_dc_synced = true;
                 }
             }
 
             if (is_dc_synced && !op_request_sent)
             {
-                printf("Requesting OPERATIONAL state for all slaves...\n");
                 ec_context.slavelist[0].state = EC_STATE_OPERATIONAL;
                 ecx_writestate(&ec_context, 0);
                 op_request_sent = true;
@@ -227,13 +225,11 @@ void* ec_thread_func(void* arg)
                 ecx_readstate(&ec_context);
                 if (ec_context.slavelist[SLAVE_ID].state == EC_STATE_OPERATIONAL)
                 {
-                     printf("All slaves reached OPERATIONAL state.\n");
                      g_is_bus_operational = true;
                 }
-                // ADDED: Check for error state and print AL status code
                 else if (ec_context.slavelist[SLAVE_ID].state & EC_STATE_ERROR)
                 {
-                    fprintf(stderr, "Error: Slave %d is in ERROR state 0x%04X, AL status code: 0x%04X (%s)\n",
+                    fprintf(stderr, "\nError: Slave %d is in ERROR state 0x%04X, AL status code: 0x%04X (%s)\n",
                            SLAVE_ID, ec_context.slavelist[SLAVE_ID].state,
                            ec_context.slavelist[SLAVE_ID].ALstatuscode,
                            ec_ALstatuscode2string(ec_context.slavelist[SLAVE_ID].ALstatuscode));
@@ -243,12 +239,22 @@ void* ec_thread_func(void* arg)
         }
         else // Bus is operational, now handle CiA 402 drive state machine
         {
+            // **CRITICAL FIX**: Always command the drive to hold its current position
+            // until a new motion profile is active. This prevents a fault on startup.
+            output_data->target_position = input_data->position_actual_value;
+
             if (!g_is_drive_operational)
             {
                 uint16_t current_status = g_current_status_word;
-                if (check_state(current_status, 0x4F, 0x40)) { output_data->control_word = 0x06; }
-                else if (check_state(current_status, 0x6F, 0x21)) { output_data->control_word = 0x07; }
-                else if (check_state(current_status, 0x6F, 0x23)) { output_data->control_word = 0x0F; }
+                
+                // Check for Fault state first and attempt to clear it.
+                if ((current_status & 0x08) != 0) // Bit 3 is the Fault bit
+                {
+                    output_data->control_word = 0x80; // Reset Fault command
+                }
+                else if (check_state(current_status, 0x4F, 0x40)) { output_data->control_word = 0x06; } // State: Switch on Disabled -> Send Shutdown
+                else if (check_state(current_status, 0x6F, 0x21)) { output_data->control_word = 0x07; } // State: Ready to Switch On -> Send Switch On
+                else if (check_state(current_status, 0x6F, 0x23)) { output_data->control_word = 0x0F; } // State: Switched On -> Send Enable Operation
                 else if (check_state(current_status, 0x6F, 0x27))
                 {
                     if (!g_is_drive_operational)
@@ -309,7 +315,11 @@ void* ec_thread_func(void* arg)
                     g_current_pos_counts += g_current_vel_cps * CYCLE_TIME_S;
                 }
                 
-                output_data->target_position = (int32_t)g_current_pos_counts;
+                // Only overwrite the target position if a move is active
+                if(g_motion_state != MOTION_IDLE)
+                {
+                    output_data->target_position = (int32_t)g_current_pos_counts;
+                }
             }
         }
     }
@@ -385,35 +395,21 @@ int main(int argc, char* argv[])
             
             pthread_create(&ec_thread, NULL, &ec_thread_func, NULL);
             
-            // Wait for the RT thread to signal that the drive is ready
             int timeout_ms = 5000;
-            while(!g_is_drive_operational && timeout_ms > 0 && keep_running)
-            {
-#ifdef _MSC_VER
-                Sleep(10);
-#else
-                struct timespec sleep_time = {0, 10 * 1000000};
-                nanosleep(&sleep_time, NULL);
-#endif
-                timeout_ms -= 10;
-            }
+            bool motion_started = false;
 
-            if (!g_is_drive_operational)
-            {
-                fprintf(stderr, "Error: Drive did not become operational within the timeout period.\n");
-                keep_running = false;
-            }
-            else
-            {
-                 // Set the target motion now that the drive is confirmed ready
-                set_target_motion(target_angle, target_speed, target_accel);
-            }
-
-            // --- Main thread becomes the status printing loop ---
+            // --- Main thread becomes the status printing and timeout loop ---
             while (keep_running)
             {
                 if (g_is_drive_operational)
                 {
+                    if (!motion_started)
+                    {
+                        // Set the target motion now that the drive is confirmed ready
+                        set_target_motion(target_angle, target_speed, target_accel);
+                        motion_started = true;
+                    }
+                    
                     motion_state_t current_motion_state = g_motion_state;
                     printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X\r", 
                        (long long)g_target_pos_counts,
@@ -424,6 +420,22 @@ int main(int argc, char* argv[])
                        (unsigned int)g_current_status_word);
                     fflush(stdout);
                 }
+                else
+                {
+                     // Print status while waiting for the drive to become operational
+                    printf("Waiting for drive... Bus State: %s | Drive Status: 0x%04X\r", 
+                        g_is_bus_operational ? "OPERATIONAL" : "INITIALIZING",
+                        (unsigned int)g_current_status_word);
+                    fflush(stdout);
+
+                    timeout_ms -= 100;
+                    if (timeout_ms <= 0)
+                    {
+                        fprintf(stderr, "\nError: Drive did not become operational within the timeout period.\n");
+                        keep_running = false;
+                    }
+                }
+
 #ifdef _MSC_VER
                 Sleep(100);
 #else
@@ -455,3 +467,4 @@ int main(int argc, char* argv[])
     printf("Shutdown complete.\n");
     return EXIT_SUCCESS;
 }
+
