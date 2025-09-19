@@ -56,6 +56,7 @@ atomic_int g_motion_state = MOTION_IDLE;
 volatile atomic_bool g_is_bus_operational = false;
 volatile atomic_bool g_is_drive_operational = false;
 volatile atomic_uint_fast16_t g_current_status_word = 0;
+volatile atomic_uint_fast16_t g_current_control_word = 0;
 volatile atomic_int_fast32_t g_actual_position = 0;
 
 
@@ -123,14 +124,14 @@ bool check_state(const uint16_t statusword, const uint16_t expected_mask, const 
 void set_target_motion(double target_deg, double speed_dps, double accel_dps2)
 {
     printf("\nNew move requested: %.2f degrees at %.2f deg/s.\n", target_deg, speed_dps);
-    
+
     // Calculate final target position in encoder counts
     long long start_pos = g_actual_position;
     g_target_pos_counts = start_pos + (long long)(target_deg * COUNTS_PER_DEGREE);
 
     g_max_vel_cps = speed_dps * COUNTS_PER_DEGREE;
     g_accel_cps2 = accel_dps2 * COUNTS_PER_DEGREE;
-    
+
     // Initialize motion state. The RT thread will pick this up.
     g_current_pos_counts = g_actual_position;
     g_current_vel_cps = 0.0;
@@ -160,9 +161,14 @@ void* ec_thread_func(void* arg)
 #ifndef _MSC_VER
     pthread_setname_np(pthread_self(), "ec_thread");
 #endif
-    
+
     bool is_dc_synced = false;
     bool op_request_sent = false;
+
+    // Initialize all output data to zero to prevent sending
+    // garbage values to the drive on startup.
+    memset(output_data, 0, sizeof(out_PDO_t));
+    output_data->mode_of_operation = CSP_MODE;
 
     // --- Timing variables for DC synchronization ---
 #ifdef _MSC_VER
@@ -197,10 +203,12 @@ void* ec_thread_func(void* arg)
         if (wkc < g_expected_wkc && g_is_bus_operational) {
             // Handle error, maybe set a global error flag
         }
-        
+
         // Update global status variables for the main thread to read
         g_current_status_word = input_data->status_word;
         g_actual_position = input_data->position_actual_value;
+        g_current_control_word = output_data->control_word;
+
 
         // --- EtherCAT State Machine Handling ---
         if (!g_is_bus_operational)
@@ -219,7 +227,7 @@ void* ec_thread_func(void* arg)
                 ecx_writestate(&ec_context, 0);
                 op_request_sent = true;
             }
-            
+
             if (op_request_sent)
             {
                 ecx_readstate(&ec_context);
@@ -239,22 +247,35 @@ void* ec_thread_func(void* arg)
         }
         else // Bus is operational, now handle CiA 402 drive state machine
         {
-            // **CRITICAL FIX**: Always command the drive to hold its current position
+            // Always command the drive to hold its current position
             // until a new motion profile is active. This prevents a fault on startup.
             output_data->target_position = input_data->position_actual_value;
 
             if (!g_is_drive_operational)
             {
                 uint16_t current_status = g_current_status_word;
-                
-                // Check for Fault state first and attempt to clear it.
-                if ((current_status & 0x08) != 0) // Bit 3 is the Fault bit
+
+                // State: Fault (0x...8) -> Send Fault Reset
+                if ((current_status & 0x08) != 0)
                 {
-                    output_data->control_word = 0x80; // Reset Fault command
+                    output_data->control_word = 0x80;
                 }
-                else if (check_state(current_status, 0x4F, 0x40)) { output_data->control_word = 0x06; } // State: Switch on Disabled -> Send Shutdown
-                else if (check_state(current_status, 0x6F, 0x21)) { output_data->control_word = 0x07; } // State: Ready to Switch On -> Send Switch On
-                else if (check_state(current_status, 0x6F, 0x23)) { output_data->control_word = 0x0F; } // State: Switched On -> Send Enable Operation
+                // State: Switch on Disabled (0x..40) -> Send Shutdown
+                else if (check_state(current_status, 0x4F, 0x40))
+                {
+                    output_data->control_word = 0x06;
+                }
+                // State: Ready to Switch On (0x..21) -> Send Switch On
+                else if (check_state(current_status, 0x6F, 0x21))
+                {
+                    output_data->control_word = 0x07;
+                }
+                // State: Switched On (0x..23) -> Send Enable Operation
+                else if (check_state(current_status, 0x6F, 0x23))
+                {
+                    output_data->control_word = 0x0F;
+                }
+                // State: Operation Enabled (0x..27) -> Drive is ready
                 else if (check_state(current_status, 0x6F, 0x27))
                 {
                     if (!g_is_drive_operational)
@@ -263,6 +284,11 @@ void* ec_thread_func(void* arg)
                         g_current_pos_counts = input_data->position_actual_value;
                         output_data->target_position = input_data->position_actual_value;
                     }
+                }
+                // Added: Handle other, unexpected states by not changing the control word.
+                else
+                {
+                    // Do nothing, maintain current control word.
                 }
             }
             else // Drive is operational, execute motion profile
@@ -273,7 +299,7 @@ void* ec_thread_func(void* arg)
                 int direction = (distance_to_target > 0) ? 1 : -1;
 
                 double decel_dist = (g_current_vel_cps * g_current_vel_cps) / (2.0 * g_accel_cps2);
-                
+
                 if (current_motion_state == MOTION_ACCELERATING)
                 {
                     if (fabs(distance_to_target) <= decel_dist) { current_motion_state = MOTION_DECELERATING; }
@@ -309,12 +335,12 @@ void* ec_thread_func(void* arg)
                     case MOTION_IDLE: break;
                 }
                 g_motion_state = current_motion_state;
-                
+
                 if (current_motion_state != MOTION_IDLE)
                 {
                     g_current_pos_counts += g_current_vel_cps * CYCLE_TIME_S;
                 }
-                
+
                 // Only overwrite the target position if a move is active
                 if(g_motion_state != MOTION_IDLE)
                 {
@@ -335,7 +361,7 @@ int main(int argc, char* argv[])
         fprintf(stderr, "Example: %s eth0 360 180\n", argv[0]);
         return EXIT_FAILURE;
     }
-    
+
     const char* const ifname = argv[1];
     double target_angle = atof(argv[2]);
     double target_speed = atof(argv[3]);
@@ -362,13 +388,13 @@ int main(int argc, char* argv[])
             printf("Configuring Distributed Clocks...\n");
             ecx_configdc(&ec_context);
             printf("DC configuration complete.\n");
-            
+
             g_expected_wkc = (ec_context.grouplist[0].outputsWKC * 2) + ec_context.grouplist[0].inputsWKC;
             printf("Calculated Expected WKC: %d\n", g_expected_wkc);
 
             output_data = (out_PDO_t*)ec_context.slavelist[SLAVE_ID].outputs;
             input_data = (in_PDO_t*)ec_context.slavelist[SLAVE_ID].inputs;
-            
+
             printf("Configuring SDOs...\n");
             int wkc = 0;
             int8_t mode = CSP_MODE;
@@ -383,7 +409,7 @@ int main(int argc, char* argv[])
             printf("Requesting SAFE-OPERATIONAL state for all slaves...\n");
             ec_context.slavelist[0].state = EC_STATE_SAFE_OP;
             ecx_writestate(&ec_context, 0);
-            
+
             int chk = ecx_statecheck(&ec_context, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
             if (chk != EC_STATE_SAFE_OP)
             {
@@ -392,9 +418,9 @@ int main(int argc, char* argv[])
                  return EXIT_FAILURE;
             }
             printf("All slaves reached SAFE-OPERATIONAL state.\n");
-            
+
             pthread_create(&ec_thread, NULL, &ec_thread_func, NULL);
-            
+
             int timeout_ms = 5000;
             bool motion_started = false;
 
@@ -409,23 +435,25 @@ int main(int argc, char* argv[])
                         set_target_motion(target_angle, target_speed, target_accel);
                         motion_started = true;
                     }
-                    
+
                     motion_state_t current_motion_state = g_motion_state;
-                    printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X\r", 
+                    printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X | Control: 0x%04X\r",
                        (long long)g_target_pos_counts,
                        (int)g_actual_position,
                        (current_motion_state == MOTION_ACCELERATING) ? "Accelerating" :
                        (current_motion_state == MOTION_CRUISING) ? "Cruising" :
                        (current_motion_state == MOTION_DECELERATING) ? "Decelerating" : "Idle",
-                       (unsigned int)g_current_status_word);
+                       (unsigned int)g_current_status_word,
+                       (unsigned int)g_current_control_word);
                     fflush(stdout);
                 }
                 else
                 {
                      // Print status while waiting for the drive to become operational
-                    printf("Waiting for drive... Bus State: %s | Drive Status: 0x%04X\r", 
+                    printf("Waiting for drive... Bus State: %s | Drive Status: 0x%04X | Control Sent: 0x%04X\r",
                         g_is_bus_operational ? "OPERATIONAL" : "INITIALIZING",
-                        (unsigned int)g_current_status_word);
+                        (unsigned int)g_current_status_word,
+                        (unsigned int)g_current_control_word);
                     fflush(stdout);
 
                     timeout_ms -= 100;
@@ -443,7 +471,7 @@ int main(int argc, char* argv[])
                 nanosleep(&sleep_time, NULL);
 #endif
             }
-            
+
             pthread_join(ec_thread, NULL);
         }
         else
@@ -454,7 +482,7 @@ int main(int argc, char* argv[])
         printf("\nRequesting INIT state for all slaves...\n");
         ec_context.slavelist[0].state = EC_STATE_INIT;
         ecx_writestate(&ec_context, 0);
-        
+
         ecx_close(&ec_context);
         printf("EtherCAT socket closed.\n");
     }
@@ -463,7 +491,7 @@ int main(int argc, char* argv[])
         fprintf(stderr, "ec_init on %s failed.\n", ifname);
         return EXIT_FAILURE;
     }
-    
+
     printf("Shutdown complete.\n");
     return EXIT_SUCCESS;
 }
