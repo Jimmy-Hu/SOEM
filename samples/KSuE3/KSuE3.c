@@ -55,8 +55,10 @@ volatile double g_accel_cps2 = 0.0;      // Counts per second^2
 atomic_int g_motion_state = MOTION_IDLE;
 volatile atomic_bool g_is_bus_operational = false;
 volatile atomic_bool g_is_drive_operational = false;
+volatile atomic_bool g_fault_detected = false;
 volatile atomic_uint_fast16_t g_current_status_word = 0;
 volatile atomic_uint_fast16_t g_current_control_word = 0;
+volatile atomic_uint_fast16_t g_last_error_code = 0;
 volatile atomic_int_fast32_t g_actual_position = 0;
 
 
@@ -247,103 +249,113 @@ void* ec_thread_func(void* arg)
         }
         else // Bus is operational, now handle CiA 402 drive state machine
         {
-            // Always command the drive to hold its current position
-            // until a new motion profile is active. This prevents a fault on startup.
-            output_data->target_position = input_data->position_actual_value;
-
             if (!g_is_drive_operational)
             {
+                // Always command the drive to hold its current position during state transitions
+                output_data->target_position = input_data->position_actual_value;
                 uint16_t current_status = g_current_status_word;
 
                 // State: Fault (0x...8) -> Send Fault Reset
                 if ((current_status & 0x08) != 0)
                 {
+                    g_fault_detected = true;
                     output_data->control_word = 0x80;
                 }
-                // State: Switch on Disabled (0x..40) -> Send Shutdown
-                else if (check_state(current_status, 0x4F, 0x40))
-                {
-                    output_data->control_word = 0x06;
-                }
-                // State: Ready to Switch On (0x..21) -> Send Switch On
-                else if (check_state(current_status, 0x6F, 0x21))
-                {
-                    output_data->control_word = 0x07;
-                }
-                // State: Switched On (0x..23) -> Send Enable Operation
-                else if (check_state(current_status, 0x6F, 0x23))
-                {
-                    output_data->control_word = 0x0F;
-                }
-                // State: Operation Enabled (0x..27) -> Drive is ready
-                else if (check_state(current_status, 0x6F, 0x27))
-                {
-                    if (!g_is_drive_operational)
-                    {
-                        g_is_drive_operational = true;
-                        g_current_pos_counts = input_data->position_actual_value;
-                        output_data->target_position = input_data->position_actual_value;
-                    }
-                }
-                // Added: Handle other, unexpected states by not changing the control word.
                 else
                 {
-                    // Do nothing, maintain current control word.
+                    g_fault_detected = false;
+                    // State: Switch on Disabled (0x..40) -> Send Shutdown
+                    if (check_state(current_status, 0x4F, 0x40))
+                    {
+                        output_data->control_word = 0x06;
+                    }
+                    // State: Ready to Switch On (0x..21) -> Send Switch On
+                    else if (check_state(current_status, 0x6F, 0x21))
+                    {
+                        output_data->control_word = 0x07;
+                    }
+                    // State: Switched On (0x..23) -> Send Enable Operation
+                    else if (check_state(current_status, 0x6F, 0x23))
+                    {
+                        output_data->control_word = 0x0F;
+                    }
+                    // State: Operation Enabled (0x..27) -> Drive is ready
+                    else if (check_state(current_status, 0x6F, 0x27))
+                    {
+                        if (!g_is_drive_operational)
+                        {
+                            g_is_drive_operational = true;
+                            g_current_pos_counts = input_data->position_actual_value;
+                            output_data->target_position = input_data->position_actual_value;
+                        }
+                    }
                 }
             }
             else // Drive is operational, execute motion profile
             {
+                // **CRITICAL FIX**: Persistently command the drive to stay enabled.
+                output_data->control_word = 0x0F;
+
                 motion_state_t current_motion_state = g_motion_state;
-                int64_t target_pos = g_target_pos_counts;
-                double distance_to_target = (double)target_pos - g_current_pos_counts;
-                int direction = (distance_to_target > 0) ? 1 : -1;
-
-                double decel_dist = (g_current_vel_cps * g_current_vel_cps) / (2.0 * g_accel_cps2);
-
-                if (current_motion_state == MOTION_ACCELERATING)
+                
+                // If idle, hold position. Otherwise, calculate next position from profiler.
+                if (current_motion_state == MOTION_IDLE)
                 {
-                    if (fabs(distance_to_target) <= decel_dist) { current_motion_state = MOTION_DECELERATING; }
-                    else if (fabs(g_current_vel_cps) >= g_max_vel_cps) { current_motion_state = MOTION_CRUISING; }
+                     output_data->target_position = input_data->position_actual_value;
                 }
-                else if (current_motion_state == MOTION_CRUISING)
+                else
                 {
-                    if (fabs(distance_to_target) <= decel_dist) { current_motion_state = MOTION_DECELERATING; }
-                }
-                else if (current_motion_state == MOTION_DECELERATING)
-                {
-                    if (fabs(distance_to_target) < 1.0 || (fabs(g_current_vel_cps) < 100.0 && fabs(distance_to_target) < 1000.0))
+                    int64_t target_pos = g_target_pos_counts;
+                    double distance_to_target = (double)target_pos - g_current_pos_counts;
+                    int direction = (distance_to_target > 0) ? 1 : -1;
+                    double decel_dist = (g_current_vel_cps * g_current_vel_cps) / (2.0 * g_accel_cps2);
+
+                    if (current_motion_state == MOTION_ACCELERATING)
                     {
-                        g_current_vel_cps = 0;
-                        g_current_pos_counts = target_pos;
-                        current_motion_state = MOTION_IDLE;
+                        if (fabs(distance_to_target) <= decel_dist) { current_motion_state = MOTION_DECELERATING; }
+                        else if (fabs(g_current_vel_cps) >= g_max_vel_cps) { current_motion_state = MOTION_CRUISING; }
                     }
-                }
+                    else if (current_motion_state == MOTION_CRUISING)
+                    {
+                        if (fabs(distance_to_target) <= decel_dist) { current_motion_state = MOTION_DECELERATING; }
+                    }
+                    else if (current_motion_state == MOTION_DECELERATING)
+                    {
+                        // Condition to end the move
+                        if ( (direction == 1 && g_current_pos_counts >= target_pos) ||
+                             (direction == -1 && g_current_pos_counts <= target_pos) ||
+                             (fabs(distance_to_target) < 100.0) ) // Small tolerance band
+                        {
+                            g_current_vel_cps = 0;
+                            g_current_pos_counts = target_pos;
+                            current_motion_state = MOTION_IDLE;
+                        }
+                    }
 
-                switch (current_motion_state)
-                {
-                    case MOTION_ACCELERATING:
-                        g_current_vel_cps += direction * g_accel_cps2 * CYCLE_TIME_S;
-                        if (fabs(g_current_vel_cps) > g_max_vel_cps) { g_current_vel_cps = direction * g_max_vel_cps; }
-                        break;
-                    case MOTION_CRUISING:
-                        g_current_vel_cps = direction * g_max_vel_cps;
-                        break;
-                    case MOTION_DECELERATING:
-                        g_current_vel_cps -= direction * g_accel_cps2 * CYCLE_TIME_S;
-                        if ((direction == 1 && g_current_vel_cps < 0) || (direction == -1 && g_current_vel_cps > 0)) { g_current_vel_cps = 0; }
-                        break;
-                    case MOTION_IDLE: break;
-                }
-                g_motion_state = current_motion_state;
+                    // Update velocity based on state
+                    switch (current_motion_state)
+                    {
+                        case MOTION_ACCELERATING:
+                            g_current_vel_cps += direction * g_accel_cps2 * CYCLE_TIME_S;
+                            if (fabs(g_current_vel_cps) > g_max_vel_cps) { g_current_vel_cps = direction * g_max_vel_cps; }
+                            break;
+                        case MOTION_CRUISING:
+                            g_current_vel_cps = direction * g_max_vel_cps;
+                            break;
+                        case MOTION_DECELERATING:
+                            g_current_vel_cps -= direction * g_accel_cps2 * CYCLE_TIME_S;
+                            if ((direction == 1 && g_current_vel_cps < 0) || (direction == -1 && g_current_vel_cps > 0)) { g_current_vel_cps = 0; }
+                            break;
+                        case MOTION_IDLE: break;
+                    }
+                    g_motion_state = current_motion_state;
 
-                if (current_motion_state != MOTION_IDLE)
-                {
-                    g_current_pos_counts += g_current_vel_cps * CYCLE_TIME_S;
-                }
-
-                // Only overwrite the target position if a move is active
-                if(g_motion_state != MOTION_IDLE)
-                {
+                    // Update position based on new velocity
+                    if (current_motion_state != MOTION_IDLE)
+                    {
+                        g_current_pos_counts += g_current_vel_cps * CYCLE_TIME_S;
+                    }
+                    
                     output_data->target_position = (int32_t)g_current_pos_counts;
                 }
             }
@@ -437,7 +449,7 @@ int main(int argc, char* argv[])
                     }
 
                     motion_state_t current_motion_state = g_motion_state;
-                    printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X | Control: 0x%04X\r",
+                    printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X | Control: 0x%04X\r\n",
                        (long long)g_target_pos_counts,
                        (int)g_actual_position,
                        (current_motion_state == MOTION_ACCELERATING) ? "Accelerating" :
@@ -449,20 +461,31 @@ int main(int argc, char* argv[])
                 }
                 else
                 {
+                    if (g_fault_detected && g_last_error_code == 0)
+                    {
+                        uint16_t error_code = 0;
+                        int size = sizeof(error_code);
+                        int wkc_sdo = ecx_SDOread(&ec_context, SLAVE_ID, 0x3C13, 0x84, FALSE, &size, &error_code, EC_TIMEOUTRXM);
+                        if (wkc_sdo > 0)
+                        {
+                            g_last_error_code = error_code;
+                        }
+                    }
+
                      // Print status while waiting for the drive to become operational
-                    printf("Waiting for drive... Bus State: %s | Drive Status: 0x%04X | Control Sent: 0x%04X\r",
+                    printf("Waiting for drive... Bus State: %s | Drive Status: 0x%04X | Control Sent: 0x%04X | Last Error: 0x%04X\r",
                         g_is_bus_operational ? "OPERATIONAL" : "INITIALIZING",
                         (unsigned int)g_current_status_word,
-                        (unsigned int)g_current_control_word);
+                        (unsigned int)g_current_control_word,
+                        (unsigned int)g_last_error_code);
                     fflush(stdout);
 
                     timeout_ms -= 100;
                     if (timeout_ms <= 0)
                     {
-                         // Modified: Add specific error message for timeout in fault state
                         if ((g_current_status_word & 0x08) != 0)
                         {
-                            fprintf(stderr, "\nError: Drive timed out in FAULT state (0x%04X).\n", g_current_status_word);
+                            fprintf(stderr, "\nError: Drive timed out in FAULT state (0x%04X). Last Error Code: 0x%04X\n", g_current_status_word, g_last_error_code);
                             fprintf(stderr, "This is likely a hardware issue. Please check:\n");
                             fprintf(stderr, "1. 24-48V Motor Power Supply is ON.\n");
                             fprintf(stderr, "2. Motor and Encoder cables are securely connected.\n");
