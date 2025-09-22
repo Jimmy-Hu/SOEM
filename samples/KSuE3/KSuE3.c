@@ -166,6 +166,7 @@ void* ec_thread_func(void* arg)
 
     bool is_dc_synced = false;
     bool op_request_sent = false;
+    bool new_setpoint_toggle = false;
 
     // Initialize all output data to zero to prevent sending
     // garbage values to the drive on startup.
@@ -293,9 +294,8 @@ void* ec_thread_func(void* arg)
             }
             else // Drive is operational, execute motion profile
             {
-                // **CRITICAL FIX**: Persistently command the drive to stay enabled.
-                output_data->control_word = 0x0F;
-
+                uint16_t base_control_word = 0x0F; // Command: Enable Operation
+                
                 motion_state_t current_motion_state = g_motion_state;
                 
                 // If idle, hold position. Otherwise, calculate next position from profiler.
@@ -305,6 +305,14 @@ void* ec_thread_func(void* arg)
                 }
                 else
                 {
+                    // **CRITICAL FIX**: Toggle the "new set-point" bit (bit 4) to make
+                    // the drive accept the new target_position on each cycle.
+                    new_setpoint_toggle = !new_setpoint_toggle;
+                    if (new_setpoint_toggle)
+                    {
+                        base_control_word |= 0x10; // Set bit 4
+                    }
+
                     int64_t target_pos = g_target_pos_counts;
                     double distance_to_target = (double)target_pos - g_current_pos_counts;
                     int direction = (distance_to_target > 0) ? 1 : -1;
@@ -358,6 +366,7 @@ void* ec_thread_func(void* arg)
                     
                     output_data->target_position = (int32_t)g_current_pos_counts;
                 }
+                output_data->control_word = base_control_word;
             }
         }
     }
@@ -449,7 +458,7 @@ int main(int argc, char* argv[])
                     }
 
                     motion_state_t current_motion_state = g_motion_state;
-                    printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X | Control: 0x%04X\r\n",
+                    printf("Target: %-9lld | Actual: %-9d | State: %-12s | Status: 0x%04X | Control: 0x%04X\n",
                        (long long)g_target_pos_counts,
                        (int)g_actual_position,
                        (current_motion_state == MOTION_ACCELERATING) ? "Accelerating" :
