@@ -60,6 +60,7 @@ volatile atomic_bool g_fault_detected = false;
 volatile atomic_uint_fast16_t g_current_status_word = 0;
 volatile atomic_uint_fast16_t g_current_control_word = 0;
 volatile atomic_uint_fast16_t g_last_error_code = 0;
+volatile atomic_uint_fast16_t g_driver_status = 0; // For object 0x3C13:D5
 volatile atomic_int_fast32_t g_actual_position = 0;
 
 
@@ -306,7 +307,7 @@ void* ec_thread_func(void* arg)
                 }
                 else
                 {
-                    // **CRITICAL FIX**: Toggle the "new set-point" bit (bit 4) to make
+                    // Toggle the "new set-point" bit (bit 4) to make
                     // the drive accept the new target_position on each cycle.
                     new_setpoint_toggle = !new_setpoint_toggle;
                     if (new_setpoint_toggle)
