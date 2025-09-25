@@ -31,6 +31,7 @@ int g_expected_wkc = 0;
 // --- Motion & Drive Constants ---
 const int SLAVE_ID = 1; // We only have one slave
 const int CSP_MODE = 8; // Cyclic Synchronous Position Mode
+const int CSV_MODE = 9; // Cyclic Synchronous Velocity Mode
 const double COUNTS_PER_REVOLUTION = 2097152.0; // From drive manual (Object 608Fh:01h, 2^21)
 const double COUNTS_PER_DEGREE = 5825.422222222222;//COUNTS_PER_REVOLUTION / 360.0;
 const int CYCLE_TIME_MS = 2;
