@@ -36,14 +36,19 @@ void signal_handler(int signum)
 
 int main(int argc, char* argv[])
 {
-    if (argc < 2)
+    if (argc < 4)
     {
-        fprintf(stderr, "Usage: %s <ifname>\n", argv[0]);
-        fprintf(stderr, "Example: %s eth0\n", argv[0]);
+        fprintf(stderr, "Usage: %s <ifname> <index> <subindex>\n", argv[0]);
+        fprintf(stderr, "Example: %s eth0 0x3C13 0xD5\n", argv[0]);
+        fprintf(stderr, "         Index and subindex can be in hex (0x...) or decimal.\n");
         return EXIT_FAILURE;
     }
 
     const char* const ifname = argv[1];
+    // Convert command-line arguments to numbers. strtol with base 0 auto-detects hex.
+    uint16_t object_index = (uint16_t)strtol(argv[2], NULL, 0);
+    uint8_t object_subindex = (uint8_t)strtol(argv[3], NULL, 0);
+    
     signal(SIGINT, signal_handler);
 
     // Initialize SOEM, bind to physical NIC
@@ -77,24 +82,38 @@ int main(int argc, char* argv[])
                      return EXIT_FAILURE;
                 }
                 printf("All slaves reached SAFE-OPERATIONAL state. Ready to read SDOs.\n\n");
+                printf("Reading Object 0x%04X:%02X...\n", object_index, object_subindex);
 
                 // Main diagnostic loop
                 while (keep_running)
                 {
-                    // **CRITICAL FIX**: SDOs are transported over EtherCAT frames. We must
+                    // SDOs are transported over EtherCAT frames. We must
                     // maintain the cyclic frame exchange for mailbox communication to work.
                     ecx_send_processdata(&ec_context);
                     ecx_receive_processdata(&ec_context, EC_TIMEOUTRET);
 
-                    uint16_t driver_status = 0;
-                    int size = sizeof(driver_status);
+                    // We will read into a 32-bit integer, as it can hold 8, 16, and 32-bit values.
+                    uint32_t sdo_value = 0;
+                    int size = sizeof(sdo_value);
                     
-                    // SDO Read of "Driver Status" (Object 0x3C13, Sub-index 0xD5)
-                    int wkc_sdo = ecx_SDOread(&ec_context, SLAVE_ID, 0x3C13, 0xD5, FALSE, &size, &driver_status, EC_TIMEOUTRXM);
+                    // SDO Read of the user-specified object
+                    int wkc_sdo = ecx_SDOread(&ec_context, SLAVE_ID, object_index, object_subindex, FALSE, &size, &sdo_value, EC_TIMEOUTRXM);
 
                     if (wkc_sdo > 0)
                     {
-                        printf("Driver Status (0x3C13:D5): 0x%04X\r", (unsigned int)driver_status);
+                        // Display the value based on the number of bytes read back
+                        if (size == 1) // 8-bit
+                        {
+                            printf("Object 0x%04X:%02X (8-bit):  0x%02X (%u)\r", object_index, object_subindex, (uint8_t)sdo_value, (uint8_t)sdo_value);
+                        }
+                        else if (size == 2) // 16-bit
+                        {
+                            printf("Object 0x%04X:%02X (16-bit): 0x%04X (%u)\r", object_index, object_subindex, (uint16_t)sdo_value, (uint16_t)sdo_value);
+                        }
+                        else // 32-bit
+                        {
+                             printf("Object 0x%04X:%02X (32-bit): 0x%08X (%u)\r", object_index, object_subindex, sdo_value, sdo_value);
+                        }
                         fflush(stdout);
                     }
                     else
@@ -140,4 +159,3 @@ int main(int argc, char* argv[])
     printf("Shutdown complete.\n");
     return EXIT_SUCCESS;
 }
-
