@@ -484,11 +484,12 @@ int main(int argc, char* argv[])
                     }
 
                      // Print status while waiting for the drive to become operational
-                    printf("Waiting for drive... Bus State: %s | Drive Status: 0x%04X | Control Sent: 0x%04X | Last Error: 0x%04X\r",
-                        g_is_bus_operational ? "OPERATIONAL" : "INITIALIZING",
+                    printf("Waiting... Bus: %s | Drv Status: 0x%04X | Ctrl Sent: 0x%04X | Last Err: 0x%04X | Drv Stat: 0x%04X\r",
+                        g_is_bus_operational ? "OP" : "INIT",
                         (unsigned int)g_current_status_word,
                         (unsigned int)g_current_control_word,
-                        (unsigned int)g_last_error_code);
+                        (unsigned int)g_last_error_code,
+                        (unsigned int)g_driver_status);
                     fflush(stdout);
 
                     timeout_ms -= 100;
